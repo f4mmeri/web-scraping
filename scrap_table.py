@@ -1,123 +1,295 @@
-import requests
-from bs4 import BeautifulSoup
-import boto3
-import uuid
+# scrap_table.py
+import os
 import json
+import uuid
+import requests
+import boto3
+import traceback
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
+from botocore.exceptions import ClientError
 
-def lambda_handler(event, context):
-    # URL de la página de sismos reportados del IGP
-    url = "https://ultimosismo.igp.gob.pe/ultimo-sismo/sismos-reportados"
+# Config (si quieres usar env vars, puedes definir TABLE_NAME en serverless.yml)
+TABLE_NAME = os.environ.get("TABLE_NAME", "TablaWebScrapping")
+
+dynamodb = boto3.resource("dynamodb")
+table_db = dynamodb.Table(TABLE_NAME)
+
+ARC_URL = (
+    "https://ide.igp.gob.pe/arcgis/rest/services/monitoreocensis/"
+    "SismosReportados/MapServer/0/query"
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def to_decimal_safe(v):
+    if v is None:
+        return None
+
+    if isinstance(v, Decimal):
+        return v
+
+    if isinstance(v, int):
+        return Decimal(v)
+
+    if isinstance(v, float):
+        try:
+            return Decimal(str(v))
+        except (InvalidOperation, ValueError):
+            return None
+
+    if isinstance(v, str):
+        s = (
+            v.strip()
+            .replace(" km", "")
+            .replace("km", "")
+            .replace(",", ".")
+            .replace("\u200b", "")
+        )
+
+        try:
+            return Decimal(s)
+        except (InvalidOperation, ValueError):
+            return s
 
     try:
-        # Realizar la solicitud HTTP a la página web
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            return {
-                'statusCode': response.status_code,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({'error': 'Error al acceder a la página web del IGP'})
-            }
+        return str(v)
+    except Exception:
+        return None
 
-        # Parsear el contenido HTML de la página web
-        soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Encontrar la tabla de sismos en el HTML
-        table = soup.find('table', class_='table')
-        if not table:
-            return {
-                'statusCode': 404,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({'error': 'No se encontró la tabla de sismos en la página web'})
-            }
+def convert_decimals(obj):
+    """
+    Convierte recursivamente Decimal -> float (JSON-serializable).
+    Mantiene el resto de tipos intactos.
+    """
+    if isinstance(obj, Decimal):
+        return float(obj)
 
-        # Extraer los encabezados de la tabla
-        headers_row = table.find('thead')
-        if headers_row:
-            headers = [header.text.strip() for header in headers_row.find_all('th')]
+    if isinstance(obj, dict):
+        return {k: convert_decimals(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [convert_decimals(v) for v in obj]
+
+    if isinstance(obj, tuple):
+        return tuple(convert_decimals(v) for v in obj)
+
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Fetch ArcGIS data
+# ---------------------------------------------------------------------------
+def fetch_latest_sismos(limit=10):
+    params = {
+        "where": "1=1",
+        "outFields": "*",
+        "orderByFields": "fecha DESC",
+        "resultRecordCount": str(limit),
+        "f": "json",
+    }
+
+    resp = requests.get(ARC_URL, params=params, timeout=15)
+    resp.raise_for_status()
+
+    data = resp.json()
+    features = data.get("features", []) or []
+
+    items = []
+
+    for feat in features:
+        attr = feat.get("attributes", {}) or {}
+        geom = feat.get("geometry", {}) or {}
+
+        item = {}
+
+        # Fecha
+        fecha_val = attr.get("fecha") or attr.get("Fecha")
+        if isinstance(fecha_val, (int, float)):
+            try:
+                item["fecha_iso"] = (
+                    datetime.utcfromtimestamp(fecha_val / 1000).isoformat() + "Z"
+                )
+            except Exception:
+                item["fecha_raw"] = str(fecha_val)
         else:
-            headers = []
+            item["fecha_raw"] = str(fecha_val) if fecha_val is not None else None
 
-        # Extraer las filas de la tabla (solo los primeros 10 sismos)
-        sismos = []
-        tbody = table.find('tbody')
-        if tbody:
-            rows = tbody.find_all('tr')[:10]  # Limitar a los últimos 10 sismos
-            
-            for row in rows:
-                cells = row.find_all('td')
-                if len(cells) > 0:
-                    sismo = {}
-                    for i, cell in enumerate(cells):
-                        if i < len(headers):
-                            sismo[headers[i]] = cell.text.strip()
-                        else:
-                            sismo[f'Campo_{i}'] = cell.text.strip()
-                    sismos.append(sismo)
+        # Magnitud
+        mag = (
+            attr.get("mag")
+            or attr.get("MAG")
+            or attr.get("magnitud")
+            or attr.get("magn")
+        )
+        item["magnitud"] = to_decimal_safe(mag)
+
+        # Profundidad
+        prof = (
+            attr.get("profundidad")
+            or attr.get("PROFUNDIDAD")
+            or attr.get("depth")
+            or attr.get("z")
+        )
+        item["profundidad_km"] = to_decimal_safe(prof)
+
+        # Referencia
+        item["referencia_texto"] = (
+            attr.get("referencia")
+            or attr.get("Referencia")
+            or attr.get("ref")
+            or attr.get("referencia_texto")
+            or None
+        )
+
+        # Coordenadas
+        lat = (
+            geom.get("y")
+            or attr.get("lat")
+            or attr.get("LAT")
+            or attr.get("latitude")
+        )
+        lon = (
+            geom.get("x")
+            or attr.get("lon")
+            or attr.get("LON")
+            or attr.get("longitude")
+        )
+
+        item["latitude"] = to_decimal_safe(lat)
+        item["longitude"] = to_decimal_safe(lon)
+
+        # ID de reporte
+        item["report_id"] = (
+            attr.get("OBJECTID")
+            or attr.get("OBJECTID_1")
+            or attr.get("id")
+            or attr.get("ID")
+            or None
+        )
+
+        # Raw attributes
+        raw = {}
+        for k, v in attr.items():
+            if isinstance(v, float):
+                raw[k] = to_decimal_safe(v)
+            elif isinstance(v, (str, int, bool)) or v is None:
+                raw[k] = v
+            else:
+                try:
+                    raw[k] = str(v)
+                except Exception:
+                    raw[k] = None
+
+        item["raw_attributes"] = raw
+        items.append(item)
+
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Dynamo helpers
+# ---------------------------------------------------------------------------
+def clean_item_for_dynamo(item):
+    return {k: v for k, v in item.items() if v is not None}
+
+
+# ---------------------------------------------------------------------------
+# Lambda handler
+# ---------------------------------------------------------------------------
+def lambda_handler(event, context):
+    result = {
+        "fetched": 0,
+        "saved": 0,
+        "table_after_save_count": 0,
+        "errors": [],
+        "sample_saved": [],
+    }
+
+    # ---------------------------------------------------------
+    # Fetch
+    # ---------------------------------------------------------
+    try:
+        sismos = fetch_latest_sismos(limit=10)
+        result["fetched"] = len(sismos)
 
         if not sismos:
-            return {
-                'statusCode': 404,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({'error': 'No se encontraron sismos en la tabla'})
-            }
+            result["errors"].append("No se obtuvieron sismos desde ArcGIS")
+            serial = convert_decimals(result)
+            return {"statusCode": 404, "body": json.dumps(serial, ensure_ascii=False)}
 
-        # Guardar los datos en DynamoDB
-        dynamodb = boto3.resource('dynamodb')
-        table_db = dynamodb.Table('TablaSismosIGP')
-
-        # Eliminar todos los elementos de la tabla antes de agregar los nuevos
-        scan = table_db.scan()
-        with table_db.batch_writer() as batch:
-            for item in scan['Items']:
-                batch.delete_item(
-                    Key={
-                        'id': item['id']
-                    }
-                )
-
-        # Insertar los nuevos datos de sismos
-        for index, sismo in enumerate(sismos, start=1):
-            sismo['#'] = index
-            sismo['id'] = str(uuid.uuid4())  # Generar un ID único para cada sismo
-            table_db.put_item(Item=sismo)
-
-        # Retornar el resultado como JSON
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({
-                'message': f'Se guardaron {len(sismos)} sismos en DynamoDB',
-                'sismos': sismos
-            }, ensure_ascii=False)
-        }
-
-    except requests.exceptions.RequestException as e:
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': f'Error en la solicitud HTTP: {str(e)}'})
-        }
     except Exception as e:
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': f'Error inesperado: {str(e)}'})
-        }
+        tb = traceback.format_exc()
+        result["errors"].append("Error fetch: " + repr(e))
+        result["errors"].append(tb)
+
+        serial = convert_decimals(result)
+        return {"statusCode": 500, "body": json.dumps(serial, ensure_ascii=False)}
+
+    # ---------------------------------------------------------
+    # Write to Dynamo
+    # ---------------------------------------------------------
+    try:
+        # Borrar items previos
+        try:
+            scan_resp = table_db.scan(ProjectionExpression="id")
+            existing = scan_resp.get("Items", []) or []
+
+            if existing:
+                with table_db.batch_writer() as batch:
+                    for it in existing:
+                        if "id" in it:
+                            batch.delete_item(Key={"id": it["id"]})
+
+        except Exception as e_scan:
+            result["errors"].append("Warn scan/delete: " + repr(e_scan))
+
+        # Guardar nuevos
+        for idx, s in enumerate(sismos, start=1):
+            item = dict(s)
+            item["id"] = str(uuid.uuid4())
+            item["numero"] = idx
+
+            cleaned = clean_item_for_dynamo(item)
+            table_db.put_item(Item=cleaned)
+            result["saved"] += 1
+
+            if len(result["sample_saved"]) < 5:
+                result["sample_saved"].append(cleaned)
+
+        # Contar después
+        try:
+            after = table_db.scan(Limit=20)
+            result["table_after_save_count"] = len(after.get("Items", []) or [])
+        except Exception as e_after:
+            result["errors"].append("Warn scan after: " + repr(e_after))
+
+    except ClientError as ce:
+        tb = traceback.format_exc()
+        result["errors"].append("Dynamo ClientError: " + repr(ce))
+        result["errors"].append(tb)
+
+        serial = convert_decimals(result)
+        return {"statusCode": 500, "body": json.dumps(serial, ensure_ascii=False)}
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        result["errors"].append("Write error: " + repr(e))
+        result["errors"].append(tb)
+
+        serial = convert_decimals(result)
+        return {"statusCode": 500, "body": json.dumps(serial, ensure_ascii=False)}
+
+    # ---------------------------------------------------------
+    # Final
+    # ---------------------------------------------------------
+    serializable_result = convert_decimals(result)
+    print("[lambda] resultado final:", json.dumps(serializable_result, ensure_ascii=False))
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(serializable_result, ensure_ascii=False),
+    }
