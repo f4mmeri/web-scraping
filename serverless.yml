@@ -1,33 +1,34 @@
 org: f4mmeri
-service: api-web-scraping-igp
+service: api-web-scraping
 
 provider:
   name: aws
-  runtime: python3.12
+  runtime: python3.13
+  # Default memory size for functions (default: 1024MB)
   memorySize: 1024
   timeout: 30
   iam:
-    role: arn:aws:iam::895179168118:role/LabRole
+    role: arn:aws:iam::646645305150:role/LabRole
 
 functions:
-  scrape_sismos:
-    handler: scrape_sismos.lambda_handler
+  scrape_table:
+    handler: scrap_table.lambda_handler  # Asegúrarse de que el nombre del archivo y la función coincidan
     package:
       include:
-        - ./**
+        - ./**  # Incluir todo el contenido del directorio
     events:
       - http:
-          path: /scrape/sismos
+          path: /scrape/table
           method: get
           cors: true
           integration: lambda
 
 resources:
   Resources:
-    TablaSismosIGP:
+    TablaWebScrapping:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: TablaSismosIGP
+        TableName: TablaWebScrapping
         AttributeDefinitions:
           - AttributeName: id
             AttributeType: S
